@@ -1,0 +1,2 @@
+# Dependensi khusus aplikasi demo
+streamlit>=1.30

@@ -1,0 +1,4 @@
+# Dependensi pipeline deteksi slot parkir GKU 1 ITERA
+# opencv-python (bukan -headless) agar alat penanda ROI bisa membuka jendela.
+opencv-python>=4.8
+numpy>=1.24

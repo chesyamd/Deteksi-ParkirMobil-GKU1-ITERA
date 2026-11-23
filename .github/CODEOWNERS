@@ -1,0 +1,12 @@
+# Code owners
+#
+# Repo ini bersifat publik untuk keperluan tugas besar. Isi username GitHub
+# yang valid bila ingin mengaktifkan aturan review otomatis; jika tidak,
+# biarkan semua baris di bawah dalam bentuk komentar.
+#
+# Contoh:
+# /src/    @username-cve
+# /tests/  @username-cve
+# /tools/  @username-dea
+# /data/   @username-dea
+# /app/    @username-ae

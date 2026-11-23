@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Pasang pustaka sistem (OpenCV)
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0
+
+      - name: Pasang dependensi
+        run: pip install -r requirements.txt
+
+      - name: Unit test
+        run: python -m unittest discover -s tests -v
+
+      - name: Bangkitkan data sintetis
+        run: python tools/make_synthetic_demo.py
+
+      - name: Evaluasi end-to-end (smoke test)
+        run: |
+          python -m src.evaluate \
+            --images sandbox/raw \
+            --background sandbox/background \
+            --roi sandbox/roi/roi.json \
+            --gt sandbox/ground_truth/ground_truth.csv \
+            --out sandbox/outputs
+
+      - name: Unggah hasil evaluasi
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hasil-evaluasi
+          path: sandbox/outputs/
