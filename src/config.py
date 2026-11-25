@@ -9,7 +9,8 @@ from dataclasses import dataclass
 # Ukuran kerja seragam untuk semua citra (lebar, tinggi).
 # Koordinat ROI slot didefinisikan pada ukuran ini, jadi kamera harus tetap
 # pada posisi yang sama selama satu sesi pengambilan.
-TARGET_SIZE = (1280, 720)
+# 1280x960 = rasio 4:3, sama dengan rasio kamera/lensa ponsel (tidak memelintir).
+TARGET_SIZE = (1280, 960)
 
 
 @dataclass

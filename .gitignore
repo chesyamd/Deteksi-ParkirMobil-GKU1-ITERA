@@ -15,9 +15,11 @@ venv/
 # Citra & hasil: tidak di-commit (dibagikan lewat Drive), struktur folder tetap ada.
 data/raw/*
 data/background/*
+data/source/*
 data/outputs/*
 !data/raw/.gitkeep
 !data/background/.gitkeep
+!data/source/.gitkeep
 !data/outputs/.gitkeep
 
 # Data sintetis (dibangkitkan ulang kapan saja)

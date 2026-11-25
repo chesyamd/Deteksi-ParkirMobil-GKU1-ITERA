@@ -30,7 +30,7 @@ Keluaran berupa status tiap slot dan jumlah slot yang tersedia.
 │   ├── evaluate.py      # baseline vs usulan vs ablasi + metrik
 │   └── main.py          # pipeline pada satu citra (CLI)
 ├── app/                 # aplikasi demo (Streamlit)
-├── tools/               # penanda ROI + generator data sintetis
+├── tools/               # penanda ROI, penyelaras citra handheld, generator sintetis
 ├── tests/               # unit test
 ├── data/                # struktur data (citra tidak disertakan)
 ├── .github/             # CI + templat issue/pull request
@@ -71,8 +71,21 @@ streamlit run app/streamlit_app.py
 
 ## Alur kerja pada data asli
 
-1. **Siapkan citra latar**: 10–20 citra area kosong → `data/background/`.
-2. **Siapkan citra uji**: citra area terisi → `data/raw/`.
+1. **Simpan citra asli** (terisi & kosong) ke `data/source/` — **tidak** di-commit.
+2. **Selaraskan** citra kosong ke kerangka citra terisi. Foto di lapangan diambil
+   *handheld* (tanpa tripod), sehingga sudut kamera bergeser antar-pengambilan dan
+   background subtraction mentah akan penuh galat. Penyelarasan memakai SIFT +
+   homografi (RANSAC):
+   ```bash
+   python tools/align_pair.py \
+       --fill  data/source/IMG_2846_terisi.jpg \
+       --empty data/source/IMG_2883_kosong.jpg \
+       --out-fill data/raw/IMG_2846.jpg \
+       --out-background data/background/IMG_2883_aligned.jpg \
+       --diag data/outputs/align_2846_2883.jpg
+   ```
+   `--empty` juga boleh berupa **folder** berisi beberapa citra kosong; semuanya
+   disejajarkan lalu diambil nilai **median** sebagai latar.
 3. **Tandai ROI**:
    ```bash
    python tools/roi_editor.py data/background/bg_00.jpg --out data/roi/roi.json

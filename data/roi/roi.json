@@ -1,0 +1,9 @@
+{
+  "image_size": [1280, 960],
+  "note": "ROI slot parkir GKU 1 - scene IMG_2846/IMG_2883 (ukuran kerja 1280x960, 4:3). Draf awal; perhalus dengan tools/roi_editor.py.",
+  "slots": [
+    {"name": "slot_1", "x": 185, "y": 620, "w": 200, "h": 170},
+    {"name": "slot_2", "x": 425, "y": 500, "w": 310, "h": 280},
+    {"name": "slot_3", "x": 745, "y": 505, "w": 320, "h": 275}
+  ]
+}
