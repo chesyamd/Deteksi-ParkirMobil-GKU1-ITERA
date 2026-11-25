@@ -32,7 +32,7 @@ Keluaran berupa status tiap slot dan jumlah slot yang tersedia.
 ├── app/                 # aplikasi demo (Streamlit)
 ├── tools/               # penanda ROI, penyelaras citra handheld, generator sintetis
 ├── tests/               # unit test
-├── data/                # struktur data (citra tidak disertakan)
+├── data/                # struktur data (citra tidak disertakan); data/scenes/ = multi-scene
 ├── .github/             # CI + templat issue/pull request
 ├── requirements.txt
 └── requirements-app.txt
@@ -44,7 +44,7 @@ Keluaran berupa status tiap slot dan jumlah slot yang tersedia.
 
 ```bash
 pip install -r requirements.txt
-python -m unittest discover -s tests -v          # 13 test
+python -m unittest discover -s tests -v          # 22 test
 ```
 
 ## Menjalankan
@@ -89,7 +89,13 @@ streamlit run app/streamlit_app.py
 3. **Tandai ROI**:
    ```bash
    python tools/roi_editor.py data/background/bg_00.jpg --out data/roi/roi.json
+   # Slot miring/trapesium? pakai mode poligon:
+   python tools/roi_editor.py data/background/bg_00.jpg --shape polygon \
+       --out data/roi/roi.json
    ```
+   ROI boleh `{x, y, w, h}` (kotak) atau `{points: [[x, y], ...]}` (poligon).
+   Untuk poligon, hanya piksel **di dalam** poligon yang dihitung sebagai
+   kendaraan — lebih akurat pada foto miring.
 4. **Isi ground truth**: `data/ground_truth/ground_truth.csv`
    (kolom `image` + satu kolom per slot, nama kolom sama dengan `roi.json`).
 5. **Evaluasi**:
@@ -99,6 +105,17 @@ streamlit run app/streamlit_app.py
        --out data/outputs --save-overlays
    ```
    Hasil: `results.csv`, `results.md`, `per_image.json`, dan `overlays/`.
+   Tambahkan `--split 0.3` untuk pembagian 70% latih / 30% uji (deterministik,
+   `--seed`).
+
+6. **Beberapa scene** (satu area, beberapa titik kamera). Buat satu subfolder per
+   scene di `data/scenes/<nama>/` berisi `raw/`, `background/`, `roi.json`, dan
+   `ground_truth.csv` (lihat `data/scenes/README.md`), lalu:
+   ```bash
+   python -m src.evaluate --scenes data/scenes --out data/outputs --save-overlays
+   ```
+   Metrik digabung (pooled) antar scene: `results.csv` (gabungan),
+   `results_per_scene.csv`, `results.md` (gabungan + rincian per scene).
 
 ## Pemetaan tahap pipeline → berkas
 
@@ -108,7 +125,7 @@ streamlit run app/streamlit_app.py
 | 2. Segmentasi | background subtraction (median N citra kosong / frame acuan) | `segment.compute_background`, `segment.difference` |
 | 3. Binerisasi | thresholding Otsu | `segment.binarize` |
 | 4. Pembersihan | morfologi opening + closing (kernel elips 5×5) | `segment.clean_mask` |
-| 5. Klasifikasi slot | rasio piksel kendaraan dalam ROI vs ambang | `classify.py` |
+| 5. Klasifikasi slot | rasio piksel kendaraan dalam ROI (kotak/poligon) vs ambang | `classify.py` |
 
 ## Versi percobaan (`src/config.py`)
 

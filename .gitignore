@@ -22,5 +22,12 @@ data/outputs/*
 !data/source/.gitkeep
 !data/outputs/.gitkeep
 
+# Multi-scene (paket I-07): citra tiap scene tidak di-commit, anotasi (roi.json,
+# ground_truth.csv) tetap masuk repo.
+data/scenes/*/raw/*
+data/scenes/*/background/*
+!data/scenes/*/raw/.gitkeep
+!data/scenes/*/background/.gitkeep
+
 # Data sintetis (dibangkitkan ulang kapan saja)
 sandbox/
