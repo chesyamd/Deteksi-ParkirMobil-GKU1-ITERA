@@ -108,12 +108,16 @@ def main():
     ap.add_argument("--prefix", default="slot")
     ap.add_argument("--shape", choices=["rect", "polygon"], default="rect",
                     help="bentuk ROI: kotak atau poligon/trapesium")
+    ap.add_argument("--size", default=f"{TARGET_SIZE[0]}x{TARGET_SIZE[1]}",
+                    help="ukuran kerja WxH (default 1280x960)")
     args = ap.parse_args()
 
+    w, h = (int(v) for v in args.size.lower().split("x"))
+    size = (w, h)
     img = cv2.imread(args.image)
     if img is None:
         raise SystemExit(f"Citra tidak ditemukan: {args.image}")
-    img = cv2.resize(img, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+    img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
 
     if args.shape == "polygon":
         slots = select_polygons(img, args.prefix)
@@ -122,7 +126,7 @@ def main():
 
     if slots:
         note = f"{Path(args.image).name} ({args.shape})"
-        save_slots(args.out, slots, size=TARGET_SIZE, note=note)
+        save_slots(args.out, slots, size=size, note=note)
         print(f"Tersimpan {len(slots)} slot -> {args.out}")
     else:
         print("Tidak ada slot yang disimpan.")
