@@ -1,11 +1,18 @@
 """Aplikasi demo deteksi ketersediaan slot parkir (Streamlit).
 
-Jalankan:
+Alur: unggah foto -> cocokkan ke database adegan (SIFT+RANSAC) -> tampilkan
+adegan terpilih, overlay slot hijau/merah, hitungan slot kosong, dan masker.
+Foto yang tidak cocok ke adegan mana pun ditolak dengan pesan jelas.
+
+Jalankan::
+
     pip install -r requirements.txt -r requirements-app.txt
+    python -m src.database build
     streamlit run app/streamlit_app.py
 """
 
-import json
+import io
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -18,125 +25,161 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.config import TARGET_SIZE, VERSIONS  # noqa: E402
-from src.pipeline import detect  # noqa: E402
-from src.preprocess import to_gray  # noqa: E402
+from src.database import SceneDatabase  # noqa: E402
+from src.pipeline import detect_photo  # noqa: E402
 from src.roi import draw_overlay  # noqa: E402
-from src.segment import compute_background  # noqa: E402
 
-SANDBOX = ROOT / "sandbox"
-IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp"}
-
-
-def decode(uploaded):
-    data = np.frombuffer(uploaded.getvalue(), np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError(f"Tidak bisa membaca berkas: {uploaded.name}")
-    return cv2.resize(img, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+DEFAULT_DB = os.environ.get("PARKIR_DATABASE", str(ROOT / "data" / "database"))
+SANDBOX_DB = ROOT / "sandbox" / "database"
+IMAGE_EXT = {"jpg", "jpeg", "png", "bmp", "heic", "heif"}
 
 
-def bg_from_uploads(files):
-    grays = [to_gray(decode(f)) for f in files]
-    return grays[0] if len(grays) == 1 else np.median(np.stack(grays), axis=0).astype(np.uint8)
+def decode_uploaded(uploaded):
+    """Baca unggahan (JPG/PNG/HEIC) -> BGR, dengan fallback Pillow."""
+    data = uploaded.getvalue()
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is not None:
+        return img
+    try:
+        from PIL import Image, ImageOps
+        try:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+        except Exception:
+            pass
+        with Image.open(io.BytesIO(data)) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Tidak bisa membaca {uploaded.name}: {exc}")
 
 
-def bg_from_sandbox():
-    paths = sorted(p for p in (SANDBOX / "background").iterdir() if p.suffix.lower() in IMAGE_EXT)
-    return compute_background(paths, VERSIONS["usulan"]) if paths else None
+@st.cache_resource(show_spinner=False)
+def load_database(root: str):
+    return SceneDatabase(root)
 
 
-def roi_from_sandbox():
-    path = SANDBOX / "roi" / "roi.json"
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))["slots"]
+def _reset_database_cache():
+    load_database.clear()
 
 
 def main():
     st.set_page_config(page_title="Deteksi Slot Parkir GKU 1", layout="wide")
-    st.title("Deteksi Ketersediaan Slot Parkir Mobil — GKU 1 ITERA")
-    st.caption("Tugas Besar Pengolahan Citra Digital · Kelompok KASKOS · Kelas RB")
+    st.title("Deteksi Ketersediaan Slot Parkir Mobil - GKU 1 ITERA")
+    st.caption("Tugas Besar Pengolahan Citra Digital - Kelompok KASKOS - Kelas RB")
 
     with st.sidebar:
+        st.header("Database adegan")
+        default_root = DEFAULT_DB
+        if not Path(default_root).is_dir() and SANDBOX_DB.is_dir():
+            default_root = str(SANDBOX_DB)
+        db_root = st.text_input("Folder database", value=default_root)
+        if st.button("Muat ulang database"):
+            _reset_database_cache()
+            st.rerun()
+
+        if Path(db_root).resolve() == SANDBOX_DB.resolve():
+            st.warning("Database SINTETIS (sandbox). Bukan data laporan.")
+
+        st.markdown("---")
         st.header("Parameter")
         versi = st.selectbox("Versi metode", list(VERSIONS))
-        ambang = st.slider("Ambang rasio kendaraan", min_value=0.05, max_value=0.90,
-                           value=0.30, step=0.05)
+        ambang = st.slider("Ambang rasio kendaraan", min_value=0.05,
+                           max_value=0.90, value=0.30, step=0.05)
         clip = st.slider("CLAHE clipLimit", min_value=0.0, max_value=6.0,
                          value=2.0, step=0.5)
-        pakai_contoh = st.checkbox("Pakai contoh (sandbox) bila tidak ada unggahan", value=True)
         st.markdown("---")
         st.markdown(
             "**Cara pakai**\n"
-            "1. Unggah citra latar (area kosong) — boleh beberapa berkas.\n"
-            "2. Unggah `roi.json` (opsional bila pakai contoh).\n"
-            "3. Unggah citra uji (area parkir)."
+            "1. Pastikan database adegan sudah di-build.\n"
+            "2. Unggah foto parkiran (JPG/PNG/HEIC).\n"
+            "3. Sistem memilih adegan, menyelaraskan latar, lalu menilai slot.\n\n"
+            "Foto dari sudut yang belum punya adegan akan **ditolak** dan "
+            "diminta menambah foto latar baru."
         )
 
     params = replace(VERSIONS[versi], ratio_threshold=ambang, clahe_clip=clip)
+    db = load_database(db_root)
 
-    kol1, kol2 = st.columns(2)
-    with kol1:
-        bg_files = st.file_uploader("Citra latar (area kosong)", type=["jpg", "jpeg", "png"],
-                                    accept_multiple_files=True)
-    with kol2:
-        roi_file = st.file_uploader("roi.json", type=["json"])
-
-    uji_files = st.file_uploader("Citra uji (area parkir)", type=["jpg", "jpeg", "png"],
-                                 accept_multiple_files=True)
-
-    if bg_files:
-        background = bg_from_uploads(bg_files)
-    elif pakai_contoh:
-        background = bg_from_sandbox()
-    else:
-        background = None
-
-    if roi_file is not None:
-        slots = json.loads(roi_file.getvalue().decode("utf-8"))
-        slots = slots["slots"] if isinstance(slots, dict) else slots
-    elif pakai_contoh:
-        slots = roi_from_sandbox()
-    else:
-        slots = None
-
-    if background is None:
-        st.warning("Citra latar belum ada. Unggah 10–20 foto area kosong, atau aktifkan mode contoh.")
-        return
-    if not slots:
-        st.warning("ROI slot belum ada. Unggah roi.json, atau aktifkan mode contoh.")
+    if not db.scenes:
+        st.error(
+            f"Database adegan kosong di `{db_root}`. Isi "
+            "`data/database/<id_adegan>/refs/` dengan foto parkiran kosong, "
+            "lalu jalankan:\n\n```bash\npython -m src.database build\n```"
+        )
         return
 
+    with st.expander(f"Adegan tersedia ({len(db.scenes)})", expanded=False):
+        for s in db.scenes:
+            note = s.meta.get("note", "")
+            st.markdown(f"- **{s.id}** - {len(s.slots)} slot. {note}")
+        if db.scenes:
+            scene0 = db.scenes[0]
+            st.image(cv2.cvtColor(scene0.background_bgr, cv2.COLOR_BGR2RGB),
+                     caption=f"Contoh latar adegan: {scene0.id}",
+                     use_container_width=True)
+
+    uji_files = st.file_uploader(
+        "Foto parkiran yang ingin diperiksa",
+        type=sorted(IMAGE_EXT), accept_multiple_files=True,
+    )
     if not uji_files:
-        if not pakai_contoh:
-            st.info("Unggah citra uji untuk mulai memproses.")
-            return
-        candidates = sorted(p for p in (SANDBOX / "raw").iterdir() if p.suffix.lower() in IMAGE_EXT)
-        if not candidates:
-            st.info("Unggah citra uji untuk mulai memproses.")
-            return
-        uji_images = [("contoh: " + candidates[0].name,
-                       cv2.resize(cv2.imread(str(candidates[0])), TARGET_SIZE))]
-    else:
-        uji_images = [(f.name, decode(f)) for f in uji_files]
+        st.info("Unggah minimal satu foto untuk mulai memproses.")
+        return
 
-    for nama, img in uji_images:
-        hasil = detect(img, background, slots, params)
-        st.subheader(nama)
+    for uploaded in uji_files:
+        st.subheader(uploaded.name)
+        try:
+            img = decode_uploaded(uploaded)
+        except ValueError as exc:
+            st.error(str(exc))
+            continue
+
+        result = detect_photo(img, db, params)
+        if not result["recognized"]:
+            st.error("Foto tidak dikenali: " + result.get("reason", ""))
+            match = result.get("scene_match") or {}
+            reg = match.get("registration") or {}
+            if reg:
+                st.caption(
+                    f"Bukti terbaik: inlier={reg.get('inliers')}, "
+                    f"good={reg.get('good_matches')}, "
+                    f"rasio={reg.get('inlier_ratio')}. "
+                    "Tambahkan foto kosong dari sudut ini ke database."
+                )
+            st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Foto uji",
+                     use_container_width=True)
+            st.divider()
+            continue
+
+        scene = db.get(result["scene_id"])
+        reg = result.get("registration") or {}
+        st.success(
+            f"Adegan terpilih: **{result['scene_id']}** "
+            f"(inlier={reg.get('inliers', '-')}, "
+            f"good={reg.get('good_matches', '-')})"
+        )
         c1, c2, c3 = st.columns(3)
-        c1.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Citra uji", use_container_width=True)
-        c2.image(cv2.cvtColor(hasil["mask"], cv2.COLOR_GRAY2RGB),
-                 caption=f"Masker biner (ambang Otsu = {hasil['threshold']:.0f})", use_container_width=True)
-        overlay = draw_overlay(img, hasil["states"])
+        c1.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Foto uji",
+                 use_container_width=True)
+        c2.image(cv2.cvtColor(result["mask"], cv2.COLOR_GRAY2RGB),
+                 caption=f"Masker biner (ambang Otsu = {result['threshold']:.0f})",
+                 use_container_width=True)
+        overlay = draw_overlay(img, result["states"])
         c3.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB),
-                 caption="Overlay hasil", use_container_width=True)
+                 caption="Overlay hasil (hijau=kosong, merah=terisi)",
+                 use_container_width=True)
 
-        st.metric("Slot tersedia", f"{hasil['free']} / {hasil['total']}")
+        st.metric("Slot tersedia", f"{result['free']} / {result['total']}")
         st.dataframe(
-            [{"Slot": s["name"], "Rasio piksel": s["ratio"], "Status": s["status"]}
-             for s in hasil["states"]],
+            [{"Slot": s["name"], "Rasio piksel": s["ratio"],
+              "Status": s["status"]} for s in result["states"]],
             use_container_width=True, hide_index=True,
         )
+        if scene is not None:
+            with st.expander("Lihat latar adegan terpilih"):
+                st.image(cv2.cvtColor(scene.background_bgr, cv2.COLOR_BGR2RGB),
+                         caption=scene.id, use_container_width=True)
         st.divider()
 
 

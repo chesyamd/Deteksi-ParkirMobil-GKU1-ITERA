@@ -2,3 +2,7 @@
 # opencv-python (bukan -headless) agar alat penanda ROI bisa membuka jendela.
 opencv-python>=4.8
 numpy>=1.24
+Pillow>=10
+
+# Unit test
+pytest>=7

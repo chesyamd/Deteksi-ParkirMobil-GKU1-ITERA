@@ -23,20 +23,23 @@ jobs:
       - name: Pasang dependensi
         run: pip install -r requirements.txt
 
-      - name: Unit test
-        run: python -m unittest discover -s tests -v
+      - name: Unit test (pytest)
+        run: python -m pytest -q
 
       - name: Bangkitkan data sintetis
         run: python tools/make_synthetic_demo.py
 
+      - name: Build database adegan sintetis
+        run: python -m src.database build --database sandbox/database
+
       - name: Evaluasi end-to-end (smoke test)
         run: |
           python -m src.evaluate \
+            --database sandbox/database \
             --images sandbox/raw \
-            --background sandbox/background \
-            --roi sandbox/roi/roi.json \
-            --gt sandbox/ground_truth/ground_truth.csv \
-            --out sandbox/outputs
+            --gt sandbox/ground_truth.csv \
+            --out sandbox/outputs \
+            --save-overlays
 
       - name: Unggah hasil evaluasi
         if: always()

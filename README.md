@@ -1,150 +1,185 @@
 # Deteksi Ketersediaan Slot Parkir Mobil GKU 1 ITERA
 
-Tugas Besar Pengolahan Citra Digital — Kelompok **KASKOS**, Kelas RB (IF25-40410),
-Program Studi Teknik Informatika, Institut Teknologi Sumatera.
+Tugas Besar Pengolahan Citra Digital - Kelompok **KASKOS**, Kelas RB
+(IF25-40410), Program Studi Teknik Informatika, Institut Teknologi Sumatera.
 
-Pipeline: **pra-pemrosesan → background subtraction → thresholding Otsu →
-morfologi → klasifikasi per ROI slot** → status setiap slot (kosong/terisi)
-beserta citra overlay.
+Pipeline: **pencocokan adegan (SIFT+RANSAC) -> registrasi homografi ->
+pra-pemrosesan (blur + CLAHE) -> background subtraction (median refs) ->
+thresholding Otsu -> morfologi -> klasifikasi per ROI slot** -> status tiap
+slot (kosong/terisi), jumlah slot kosong, masker, dan overlay.
+
+Foto lapangan diambil **handheld** dengan ponsel (HEIC, 4032x3024, 4:3) dari
+banyak sudut. Karena kamera tidak tetap, sistem **tidak** memakai satu
+`roi.json` global. Setiap sudut pandang adalah satu **adegan** dengan database
+sendiri.
 
 ---
-
-## Ringkasan
-
-Sistem menerima dua masukan: **citra latar** (area parkir kosong) dan **citra uji**
-(area parkir terisi). Selisih keduanya digunakan untuk menemukan piksel kendaraan,
-lalu setiap slot parkir dinilai dari **rasio piksel kendaraan** di dalam ROI-nya.
-Keluaran berupa status tiap slot dan jumlah slot yang tersedia.
 
 ## Struktur repo
 
 ```
-.
-├── src/                 # pipeline inti
-│   ├── config.py        # parameter + preset versi percobaan
-│   ├── preprocess.py    # tahap 1: resize, grayscale, Gaussian blur, CLAHE
-│   ├── segment.py       # tahap 2-4: background subtraction, Otsu, morfologi
-│   ├── roi.py           # definisi ROI slot + penggambar overlay
-│   ├── classify.py      # tahap 5: rasio piksel kendaraan -> kosong/terisi
-│   ├── pipeline.py      # rangkaian seluruh tahap
-│   ├── evaluate.py      # baseline vs usulan vs ablasi + metrik
-│   └── main.py          # pipeline pada satu citra (CLI)
-├── app/                 # aplikasi demo (Streamlit)
-├── tools/               # penanda ROI, penyelaras citra handheld, generator sintetis
-├── tests/               # unit test
-├── data/                # struktur data (citra tidak disertakan); data/scenes/ = multi-scene
-├── .github/             # CI + templat issue/pull request
-├── requirements.txt
-└── requirements-app.txt
+src/
+    config.py        # SEMUA parameter + preset baseline/usulan/ablasi
+    preprocess.py    # resize, grayscale, Gaussian blur, CLAHE
+    registration.py  # SIFT + homografi RANSAC, warp, transformasi ROI
+    database.py      # database adegan, build latar median, match foto
+    segment.py       # background subtraction, Otsu, morfologi
+    classify.py      # rasio piksel kendaraan -> kosong/terisi
+    roi.py           # ROI kotak/poligon + overlay
+    pipeline.py      # rangkaian tahap + deteksi per adegan
+    evaluate.py      # baseline vs usulan vs ablasi, sensitivitas, kasus gagal
+    main.py          # deteksi satu foto (CLI)
+app/                 # demo Streamlit
+tools/               # konversi HEIC, editor/pratinjau ROI, generator sintetis
+tests/               # unit test (pytest)
+docs/                # kerangka laporan, protokol, bacaan, naskah video
+data/                # struktur data (foto tidak di-commit), lihat data/README.md
+sandbox/             # data SINTETIS untuk smoke test (tidak di-commit)
+.github/             # CI + templat issue/PR
+requirements.txt
+requirements-app.txt
+requirements-tools.txt
 ```
 
-`sandbox/` (hasil data sintetis) dan `data/` (citra asli) **tidak di-commit**.
+## Instalasi (reproduksi)
 
-## Instalasi
+Python 3.11+ (diuji 3.12). Disarankan memakai venv.
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Linux/macOS:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests -v          # 22 test
 ```
+
+Opsional:
+- `pip install -r requirements-app.txt` untuk aplikasi Streamlit.
+- `pip install -r requirements-tools.txt` untuk konversi HEIC cepat
+  (`pillow-heif`); tanpa itu, `tools/convert_heic.py` memakai ImageMagick.
 
 ## Menjalankan
 
+### 1) Smoke test data sintetis (BUKAN data laporan)
+
 ```bash
-# 1) Smoke test pada data sintetis (memastikan kode berjalan end-to-end)
 python tools/make_synthetic_demo.py
-python -m src.evaluate --images sandbox/raw --background sandbox/background \
-    --roi sandbox/roi/roi.json --gt sandbox/ground_truth/ground_truth.csv \
-    --out sandbox/outputs --save-overlays
+python -m src.database build --database sandbox/database
+python -m src.evaluate --database sandbox/database --images sandbox/raw \
+    --gt sandbox/ground_truth.csv --out sandbox/outputs --save-overlays
+```
 
-# 2) Deteksi pada satu citra
-python -m src.main --image data/raw/gku1_pagi_001.jpg --background data/background \
-    --roi data/roi/roi.json --out data/outputs/gku1_pagi_001_overlay.jpg
+> Angka dari `sandbox/` hanya untuk memastikan kode berjalan. **Jangan
+> dimasukkan ke laporan sebagai hasil penelitian.**
 
-# 3) Aplikasi demo
-pip install -r requirements-app.txt
+### 2) Data asli (setelah foto tersedia)
+
+```bash
+# HEIC -> JPG 1280x960
+python tools/convert_heic.py --input data/source --out data/source/jpg
+
+# isi data/database/<id_adegan>/refs/ + scene.json, lalu:
+python -m src.database build
+python -m src.database list
+
+# tandai ROI pada bingkai kanonik
+python tools/roi_editor.py data/database/<id_adegan>/canonical.jpg \
+    --shape polygon --out data/database/<id_adegan>/roi.json
+python tools/preview_roi.py --image data/database/<id_adegan>/canonical.jpg \
+    --roi data/database/<id_adegan>/roi.json --out data/outputs/roi_preview.jpg
+
+# build ulang setelah ROI siap
+python -m src.database build
+
+# evaluasi
+python -m src.evaluate --database data/database --images data/raw \
+    --gt data/ground_truth/ground_truth.csv --out data/outputs --save-overlays
+```
+
+### 3) Deteksi satu foto
+
+```bash
+python -m src.main --image data/raw/gku1_000.jpg --database data/database \
+    --version usulan --out data/outputs/gku1_000_overlay.jpg
+```
+
+### 4) Aplikasi demo
+
+```bash
+pip install -r requirements.txt -r requirements-app.txt
 streamlit run app/streamlit_app.py
 ```
 
-> **Penting:** isi `sandbox/` adalah data **sintetis** dan hanya untuk memastikan
-> program berjalan. Angkanya tidak dilaporkan sebagai hasil proyek. Hasil resmi
-> hanya dari citra asli.
+Aplikasi menampilkan adegan terpilih, overlay hijau (kosong)/merah (terisi),
+hitungan slot, dan masker. Foto yang tidak cocok ke adegan mana pun ditolak
+dengan pesan "perlu foto latar baru".
 
-## Alur kerja pada data asli
+## Konsep pengolahan citra yang dipakai
 
-1. **Simpan citra asli** (terisi & kosong) ke `data/source/` — **tidak** di-commit.
-2. **Selaraskan** citra kosong ke kerangka citra terisi. Foto di lapangan diambil
-   *handheld* (tanpa tripod), sehingga sudut kamera bergeser antar-pengambilan dan
-   background subtraction mentah akan penuh galat. Penyelarasan memakai SIFT +
-   homografi (RANSAC):
-   ```bash
-   python tools/align_pair.py \
-       --fill  data/source/IMG_2846_terisi.jpg \
-       --empty data/source/IMG_2883_kosong.jpg \
-       --out-fill data/raw/IMG_2846.jpg \
-       --out-background data/background/IMG_2883_aligned.jpg \
-       --diag data/outputs/align_2846_2883.jpg
-   ```
-   `--empty` juga boleh berupa **folder** berisi beberapa citra kosong; semuanya
-   disejajarkan lalu diambil nilai **median** sebagai latar.
-3. **Tandai ROI**:
-   ```bash
-   python tools/roi_editor.py data/background/bg_00.jpg --out data/roi/roi.json
-   # Slot miring/trapesium? pakai mode poligon:
-   python tools/roi_editor.py data/background/bg_00.jpg --shape polygon \
-       --out data/roi/roi.json
-   ```
-   ROI boleh `{x, y, w, h}` (kotak) atau `{points: [[x, y], ...]}` (poligon).
-   Untuk poligon, hanya piksel **di dalam** poligon yang dihitung sebagai
-   kendaraan — lebih akurat pada foto miring.
-4. **Isi ground truth**: `data/ground_truth/ground_truth.csv`
-   (kolom `image` + satu kolom per slot, nama kolom sama dengan `roi.json`).
-5. **Evaluasi**:
-   ```bash
-   python -m src.evaluate --images data/raw --background data/background \
-       --roi data/roi/roi.json --gt data/ground_truth/ground_truth.csv \
-       --out data/outputs --save-overlays
-   ```
-   Hasil: `results.csv`, `results.md`, `per_image.json`, dan `overlays/`.
-   Tambahkan `--split 0.3` untuk pembagian 70% latih / 30% uji (deterministik,
-   `--seed`).
-
-6. **Beberapa scene** (satu area, beberapa titik kamera). Buat satu subfolder per
-   scene di `data/scenes/<nama>/` berisi `raw/`, `background/`, `roi.json`, dan
-   `ground_truth.csv` (lihat `data/scenes/README.md`), lalu:
-   ```bash
-   python -m src.evaluate --scenes data/scenes --out data/outputs --save-overlays
-   ```
-   Metrik digabung (pooled) antar scene: `results.csv` (gabungan),
-   `results_per_scene.csv`, `results.md` (gabungan + rincian per scene).
-
-## Pemetaan tahap pipeline → berkas
-
-| Tahap | Konsep pengolahan citra | Fungsi |
+| Tahap | Konsep | Berkas |
 |---|---|---|
-| 1. Pra-pemrosesan | resize, grayscale, Gaussian blur 5×5, CLAHE (clip 2.0, tile 8×8) | `preprocess.py` |
-| 2. Segmentasi | background subtraction (median N citra kosong / frame acuan) | `segment.compute_background`, `segment.difference` |
-| 3. Binerisasi | thresholding Otsu | `segment.binarize` |
-| 4. Pembersihan | morfologi opening + closing (kernel elips 5×5) | `segment.clean_mask` |
-| 5. Klasifikasi slot | rasio piksel kendaraan dalam ROI (kotak/poligon) vs ambang | `classify.py` |
+| 0. Pencocokan adegan | SIFT + rasio Lowe + RANSAC, inlier terbanyak | `registration.py`, `database.py` |
+| 0. Registrasi | homografi, warpPerspective, valid mask | `registration.py` |
+| 1. Pra-pemrosesan | resize 4:3, grayscale, Gaussian blur, CLAHE | `preprocess.py` |
+| 2. Segmentasi | background subtraction, median banyak refs | `segment.py`, `database.py` |
+| 3. Binerisasi | thresholding Otsu | `segment.py` |
+| 4. Pembersihan | morfologi opening + closing | `segment.py` |
+| 5. Klasifikasi | rasio piksel kendaraan dalam ROI kotak/poligon | `classify.py`, `roi.py` |
 
 ## Versi percobaan (`src/config.py`)
 
 | Nama | Isi |
 |---|---|
-| `baseline` | frame acuan tunggal + Otsu, **tanpa** blur/CLAHE/morfologi |
-| `usulan` | pipeline penuh (blur + CLAHE + background median + Otsu + morfologi) |
+| `baseline` | satu frame latar, **tanpa** registrasi/pra-proses/morfologi |
+| `usulan` | registrasi + latar median + blur + CLAHE + Otsu + morfologi |
+| `ablasi_tanpa_registrasi` | usulan tanpa penyelarasan latar |
+| `ablasi_tanpa_median` | latar = satu frame kanonik (bukan median) |
 | `ablasi_tanpa_clahe` | usulan tanpa CLAHE |
-| `ablasi_tanpa_morfologi` | usulan tanpa morfologi |
 | `ablasi_tanpa_blur` | usulan tanpa Gaussian blur |
+| `ablasi_tanpa_morfologi` | usulan tanpa opening/closing |
 
-Baseline memakai **satu citra acuan** (analogi *frame differencing* pada citra
-statis), sedangkan metode usulan memakai **median 10–20 citra kosong** sebagai latar.
+Semua parameter terpusat di `Params` (`src/config.py`). Menambah versi baru
+cukup menambah preset di `VERSIONS`.
 
-## Catatan tentang data
+## Keluaran evaluasi
 
-Citra asli tidak disertakan dalam repo karena ukuran dan privasi (wajah/plat
-nomor). Dataset tersedia atas permintaan. Hasil evaluasi resmi dihitung dari
-citra asli tersebut, bukan dari data sintetis.
+`python -m src.evaluate` menghasilkan di folder `--out`:
+
+- `results.csv` - satu baris per versi: akurasi, precision/recall/F1 (makro),
+  TP/FP/FN/TN, jumlah slot, jumlah citra, jumlah ditolak.
+- `results.md` - tabel baseline vs usulan vs ablasi, confusion matrix,
+  sensitivitas ambang, rekognisi adegan, daftar kasus gagal.
+- `sensitivity.csv` - akurasi/precision/recall/F1 vs ambang rasio (usulan).
+- `failures.csv` - slot salah klasifikasi dan foto ditolak.
+- `per_image.json` - prediksi per citra tiap versi.
+- `overlays/` - overlay metode usulan (opsional `--save-overlays`).
+
+Metrik dihitung pada **level slot**. Foto yang tidak cocok ke adegan mana pun
+ditolak dan dicatat, tidak ditebak.
+
+## Data & privasi
+
+- Foto mentah besar (HEIC/4032x3024) **tidak di-commit**; lihat `.gitignore`.
+- Foto kerja 1280x960 juga tidak di-commit; bagikan lewat Drive.
+- Yang di-commit: `scene.json`, `roi.json`, `ground_truth.csv`, template,
+  kode, tes, dan dokumen.
+- Data sintetis ada di `sandbox/` dan tidak di-commit.
+
+## Dokumen
+
+Kerangka dokumen ada di `docs/`: outline laporan 5 bab, template tabel hasil,
+protokol pengambilan foto, daftar bacaan, catatan progres mingguan, dan naskah
+video demo. Isi yang bertanda `TODO` wajib dilengkapi tim setelah data asli
+masuk.
 
 ## Tim
 
