@@ -27,17 +27,25 @@ def load_reference_frame(path, p: Params):
     return to_gray(load_image(path, p.resize))
 
 
-def difference(current_bgr, reference_gray, p: Params):
+def difference(current_bgr, reference_gray, p: Params, valid_mask=None):
     """|preprocess(citra kini) - enhance(citra referensi)| dalam grayscale.
 
     Citra referensi dipastikan seukuran citra kini agar selisih selalu valid,
-    walau referensi diberikan pada resolusi yang berbeda.
+    walau referensi diberikan pada resolusi yang berbeda. Bila ``valid_mask``
+    diberikan (hasil warp registrasi), piksel di luar area valid dibuat nol
+    agar border hitam tidak dianggap kendaraan.
     """
     cur = preprocess(current_bgr, p)
     ref = enhance(reference_gray, p)
     if ref.shape != cur.shape:
         ref = cv2.resize(ref, (cur.shape[1], cur.shape[0]), interpolation=cv2.INTER_AREA)
-    return cv2.absdiff(cur, ref)
+    diff = cv2.absdiff(cur, ref)
+    if valid_mask is not None:
+        if valid_mask.shape != diff.shape:
+            valid_mask = cv2.resize(valid_mask, (diff.shape[1], diff.shape[0]),
+                                    interpolation=cv2.INTER_NEAREST)
+        diff = cv2.bitwise_and(diff, diff, mask=valid_mask)
+    return diff
 
 
 def binarize(diff, p: Params):

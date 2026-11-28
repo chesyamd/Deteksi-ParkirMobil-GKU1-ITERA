@@ -1,42 +1,47 @@
-"""Evaluasi: baseline vs metode usulan vs ablasi pada data uji.
+"""Evaluasi database adegan: baseline vs usulan vs ablasi.
 
-Mendukung dua mode:
+Perintah utama::
 
-1. **Satu scene** (layout lama):
-       python -m src.evaluate --images data/raw --background data/background \\
-           --roi data/roi/roi.json --gt data/ground_truth/ground_truth.csv \\
-           --out data/outputs [--save-overlays] [--split 0.3]
+    python -m src.evaluate \
+        --database data/database \
+        --images data/raw \
+        --gt data/ground_truth/ground_truth.csv \
+        --out data/outputs --save-overlays
 
-2. **Multi-scene** (satu area, beberapa titik kamera; paket I-07). Setiap scene
-   punya latar & ROI sendiri, lalu metrik digabung (pooled) antar scene:
-       python -m src.evaluate --scenes data/scenes --out data/outputs [--save-overlays]
+Keluaran:
+- ``results.csv``       : satu baris per versi (metrik level slot)
+- ``results.md``        : tabel + confusion matrix + sensitivitas + kasus gagal
+- ``sensitivity.csv``   : sensitivitas ambang rasio (metode usulan)
+- ``failures.csv``      : slot salah klasifikasi & foto ditolak
+- ``per_image.json``    : prediksi per citra untuk tiap versi
+- ``overlays/``         : overlay metode usulan (opsional)
 
-   Tata letak tiap scene:
-       data/scenes/<scene>/raw/*.jpg
-       data/scenes/<scene>/background/*.jpg   (atau satu berkas background.jpg)
-       data/scenes/<scene>/roi.json
-       data/scenes/<scene>/ground_truth.csv
-
-Metrik dihitung pada level SLOT (akurasi, precision, recall, F1 makro) +
-confusion matrix, disimpan sebagai CSV dan Markdown.
+Foto yang tidak cocok ke adegan mana pun DITOLAK dan dicatat, bukan ditebak.
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
 import json
 import random
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .config import VERSIONS, Params
-from .pipeline import detect
+import cv2
+
+from .config import (SENSITIVITY_THRESHOLDS, VERSION_ORDER, VERSIONS, Params)
+from .database import IMAGE_EXT, SceneDatabase
+from .pipeline import detect_scene
 from .preprocess import load_image
 from .roi import draw_overlay, load_slots
-from .segment import compute_background, load_reference_frame
 
 POSITIVE = "terisi"
-IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
+# --------------------------------------------------------------------------- #
+# Ground truth
+# --------------------------------------------------------------------------- #
 def _norm_label(value):
     s = str(value).strip().lower()
     if s in {"1", "terisi", "occupied", "ada", "true", "ya"}:
@@ -46,23 +51,49 @@ def _norm_label(value):
     raise ValueError(f"Label ground truth tidak dikenal: {value!r}")
 
 
-def read_ground_truth(path):
-    """CSV: kolom 'image' lalu satu kolom per slot (nama kolom = nama slot)."""
+def _gt_rows(path):
     with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+        return list(csv.DictReader(f))
+
+
+def read_ground_truth(path):
+    """Baca label per citra (kompatibel format lama, kolom ``scene`` diabaikan).
+
+    Mengembalikan ``{nama_citra: {nama_slot: label}}``.
+    """
     gt = {}
-    for row in rows:
+    for row in _gt_rows(path):
         image = (row.get("image") or "").strip()
         if not image:
             continue
         gt[image] = {
             k: _norm_label(v)
             for k, v in row.items()
-            if k and k != "image" and str(v).strip() != ""
+            if k and k not in {"image", "scene"} and str(v).strip() != ""
         }
     return gt
 
 
+def read_ground_truth_with_scene(path):
+    """Baca GT baru: ``{nama_citra: {"scene": id|None, "labels": {...}}}``."""
+    gt = {}
+    for row in _gt_rows(path):
+        image = (row.get("image") or "").strip()
+        if not image:
+            continue
+        scene = (row.get("scene") or "").strip() or None
+        labels = {
+            k: _norm_label(v)
+            for k, v in row.items()
+            if k and k not in {"image", "scene"} and str(v).strip() != ""
+        }
+        gt[image] = {"scene": scene, "labels": labels}
+    return gt
+
+
+# --------------------------------------------------------------------------- #
+# Utilitas data & metrik
+# --------------------------------------------------------------------------- #
 def list_images(images):
     path = Path(images)
     if path.is_file():
@@ -71,11 +102,7 @@ def list_images(images):
 
 
 def split_images(images, test_frac=0.0, seed=42):
-    """Bagi citra menjadi (latih, uji) secara deterministik.
-
-    Bila `test_frac` <= 0 atau citra terlalu sedikit, tidak ada pembagian dan
-    seluruh citra dipakai untuk evaluasi (mengembalikan ([], semua)).
-    """
+    """Bagi citra menjadi (latih, uji) secara deterministik."""
     images = list(images)
     if not (0.0 < test_frac < 1.0) or len(images) < 2:
         return [], images
@@ -113,7 +140,7 @@ def metrics_from_counts(tp, fp, fn, tn):
         return p, r, f
 
     p_pos, r_pos, f_pos = prf(tp, fp, fn)
-    p_neg, r_neg, f_neg = prf(tn, fn, fp)  # kelas "kosong" sebagai positif
+    p_neg, r_neg, f_neg = prf(tn, fn, fp)
     acc = (tp + tn) / total if total else 0.0
     return {
         "accuracy": acc,
@@ -132,48 +159,24 @@ def metrics(pairs):
     return metrics_from_counts(*confusion(pairs))
 
 
-def evaluate_version(name, p: Params, images, gt, slots, background_paths, reference_path):
-    """Evaluasi satu versi pada satu scene. Mengembalikan (metrik, per_citra)."""
-    if p.method == "bgsub":
-        reference = compute_background(background_paths, p)
-    else:
-        ref = reference_path or background_paths[0]
-        reference = load_reference_frame(ref, p)
-
-    pairs = []
-    per_image = {}
-    for img_path in images:
-        bgr = load_image(img_path, p.resize)
-        res = detect(bgr, reference, slots, p)
-        preds = {s["name"]: s["status"] for s in res["states"]}
-        per_image[img_path.name] = preds
-        truth = gt.get(img_path.name)
-        if truth is None:
-            continue
-        for s in slots:
-            if s["name"] in truth:
-                pairs.append((truth[s["name"]], preds[s["name"]]))
-
-    result = metrics(pairs)
-    result["version"] = name
-    return result, per_image
-
-
-def _save_overlays(images, background_paths, slots, p, ov_dir):
-    import cv2
-
-    reference = compute_background(background_paths, p) if p.method == "bgsub" \
-        else load_reference_frame(background_paths[0], p)
-    ov_dir.mkdir(parents=True, exist_ok=True)
-    for img_path in images:
-        bgr = load_image(img_path, p.resize)
-        res = detect(bgr, reference, slots, p)
-        cv2.imwrite(str(ov_dir / f"{img_path.stem}_overlay.jpg"),
-                    draw_overlay(bgr, res["states"]))
+def aggregate_scenes(rows_per_scene):
+    """Gabungkan confusion matrix antar scene (kompatibilitas format lama)."""
+    acc = {name: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for name in VERSIONS}
+    for r in rows_per_scene:
+        acc[r["version"]]["tp"] += r["tp"]
+        acc[r["version"]]["fp"] += r["fp"]
+        acc[r["version"]]["fn"] += r["fn"]
+        acc[r["version"]]["tn"] += r["tn"]
+    results = []
+    for name in VERSIONS:
+        m = metrics_from_counts(**acc[name])
+        m["version"] = name
+        results.append(m)
+    return results
 
 
 def discover_scenes(root):
-    """Telusuri folder multi-scene: tiap subfolder yang punya roi.json."""
+    """Telusuri layout lama (data/scenes/<nama>/...) untuk kompatibilitas."""
     root = Path(root)
     scenes = []
     for d in sorted(p for p in root.iterdir() if p.is_dir()):
@@ -202,12 +205,161 @@ def discover_scenes(root):
 
 
 # --------------------------------------------------------------------------- #
+# Evaluasi database
+# --------------------------------------------------------------------------- #
+@dataclass
+class ImageRecord:
+    name: str
+    path: Path
+    image: np.ndarray
+    gt_scene: str | None
+    gt_labels: dict
+    match: object
+    scene: object | None
+    scene_for_eval: object | None
+    reason: str = ""
+
+
+def _resolve_records(db: SceneDatabase, images, gt, params: Params):
+    records = []
+    for path in images:
+        entry = gt.get(path.name)
+        if entry is None:
+            print(f"  lewati (tidak ada baris GT): {path.name}")
+            continue
+        img = load_image(path)
+        match = db.match(img, params)
+        gt_scene = entry.get("scene")
+        if gt_scene:
+            scene = db.get(gt_scene)
+            reason = "" if scene else f"adegan GT '{gt_scene}' tidak ada di database"
+        else:
+            scene = match.scene
+            reason = match.reason
+        records.append(ImageRecord(
+            name=path.name,
+            path=path,
+            image=img,
+            gt_scene=gt_scene,
+            gt_labels=entry.get("labels", {}),
+            match=match,
+            scene=scene,
+            scene_for_eval=scene,
+            reason=reason,
+        ))
+    return records
+
+
+def _match_for_scene(record, scene):
+    """Pakai homografi hasil matching hanya bila adegannya sama."""
+    m = record.match
+    if m is not None and m.scene is not None and scene is not None \
+            and m.scene.id == scene.id:
+        return m.result
+    return None
+
+
+def evaluate_version(name, p: Params, records):
+    """Evaluasi satu versi. Mengembalikan (metrik, per_citra, slot_records, ditolak)."""
+    pairs = []
+    per_image = {}
+    slot_records = []
+    rejected = []
+
+    for rec in records:
+        if rec.scene_for_eval is None:
+            rejected.append({
+                "image": rec.name, "scene": rec.gt_scene,
+                "reason": rec.reason or "adegan tidak dikenali",
+            })
+            continue
+        match = _match_for_scene(rec, rec.scene_for_eval)
+        res = detect_scene(rec.image, rec.scene_for_eval, p, match=match)
+        if not res.get("recognized", False):
+            rejected.append({
+                "image": rec.name, "scene": rec.scene_for_eval.id,
+                "reason": res.get("reason", "registrasi gagal"),
+            })
+            continue
+
+        preds = {s["name"]: s["status"] for s in res["states"]}
+        ratios = {s["name"]: s["ratio"] for s in res["states"]}
+        per_image[rec.name] = {
+            "scene": rec.scene_for_eval.id,
+            "states": res["states"],
+            "free": res["free"],
+            "total": res["total"],
+            "threshold": res["threshold"],
+        }
+        for slot in rec.scene_for_eval.slots:
+            name_slot = slot["name"]
+            if name_slot not in rec.gt_labels:
+                continue
+            truth = rec.gt_labels[name_slot]
+            pred = preds[name_slot]
+            pairs.append((truth, pred))
+            slot_records.append({
+                "image": rec.name,
+                "scene": rec.scene_for_eval.id,
+                "slot": name_slot,
+                "truth": truth,
+                "pred": pred,
+                "ratio": ratios[name_slot],
+                "threshold": res["threshold"],
+            })
+
+    result = metrics(pairs)
+    result["version"] = name
+    result["n_images"] = len(records)
+    result["n_accepted"] = len(per_image)
+    result["n_rejected"] = len(rejected)
+    return result, per_image, slot_records, rejected
+
+
+def threshold_sensitivity(slot_records, thresholds=SENSITIVITY_THRESHOLDS):
+    rows = []
+    for t in thresholds:
+        pairs = [(r["truth"], POSITIVE if r["ratio"] >= t else "kosong")
+                 for r in slot_records]
+        m = metrics(pairs)
+        m["threshold"] = float(t)
+        rows.append(m)
+    return rows
+
+
+def _scene_recognition(records):
+    with_gt = [r for r in records if r.gt_scene]
+    correct = 0
+    rejected = 0
+    wrong = []
+    for r in with_gt:
+        if not r.match.recognized:
+            rejected += 1
+            continue
+        if r.match.scene.id == r.gt_scene:
+            correct += 1
+        else:
+            wrong.append({
+                "image": r.name, "truth": r.gt_scene,
+                "pred": r.match.scene.id,
+                "inliers": r.match.result.inliers if r.match.result else 0,
+            })
+    total = len(with_gt)
+    return {
+        "n_with_gt": total,
+        "correct": correct,
+        "rejected": rejected,
+        "wrong": wrong,
+        "accuracy": correct / total if total else 0.0,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Penulisan keluaran
 # --------------------------------------------------------------------------- #
-
 FIELDS = ["version", "accuracy", "precision", "recall", "f1",
           "precision_macro", "recall_macro", "f1_macro",
-          "tp", "fp", "fn", "tn", "n_slot"]
+          "tp", "fp", "fn", "tn", "n_slot", "n_images", "n_accepted", "n_rejected"]
 
 
 def _pct(x):
@@ -225,161 +377,187 @@ def _write_csv(path, rows, fields):
 
 def _md_table(results):
     out = [
-        "| Versi | Akurasi | Precision (makro) | Recall (makro) | F1 (makro) | TP | FP | FN | TN |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| Versi | Akurasi | Precision (makro) | Recall (makro) | F1 (makro) | "
+        "TP | FP | FN | TN | Ditolak |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         out.append(
             f"| {r['version']} | {_pct(r['accuracy'])} | {_pct(r['precision_macro'])} | "
             f"{_pct(r['recall_macro'])} | {_pct(r['f1_macro'])} | "
-            f"{r['tp']} | {r['fp']} | {r['fn']} | {r['tn']} |"
+            f"{r['tp']} | {r['fp']} | {r['fn']} | {r['tn']} | {r['n_rejected']} |"
         )
     return out
 
 
-def aggregate_scenes(rows_per_scene):
-    """Gabungkan confusion matrix antar scene (pooled) per versi, lalu hitung metrik."""
-    acc = {name: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for name in VERSIONS}
-    for r in rows_per_scene:
-        acc[r["version"]]["tp"] += r["tp"]
-        acc[r["version"]]["fp"] += r["fp"]
-        acc[r["version"]]["fn"] += r["fn"]
-        acc[r["version"]]["tn"] += r["tn"]
-    results = []
-    for name in VERSIONS:
-        m = metrics_from_counts(**acc[name])
-        m["version"] = name
-        results.append(m)
-    return results
+def _md_sensitivity(rows):
+    out = [
+        "| Ambang rasio | Akurasi | Precision (makro) | Recall (makro) | F1 (makro) |",
+        "|---|---|---|---|---|",
+    ]
+    for r in rows:
+        out.append(f"| {r['threshold']:.2f} | {_pct(r['accuracy'])} | "
+                   f"{_pct(r['precision_macro'])} | {_pct(r['recall_macro'])} | "
+                   f"{_pct(r['f1_macro'])} |")
+    return out
 
 
-def run_single(args):
-    background_paths = list_images(args.background)
-    if not background_paths:
-        raise SystemExit("Folder latar kosong: " + args.background)
+def _save_overlays(records, p: Params, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for rec in records:
+        if rec.scene_for_eval is None:
+            canvas = rec.image.copy()
+            cv2.putText(canvas, "TIDAK DIKENALI - perlu foto latar baru",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255),
+                        2, cv2.LINE_AA)
+            cv2.imwrite(str(out_dir / f"{Path(rec.name).stem}_rejected.jpg"), canvas)
+            continue
+        match = _match_for_scene(rec, rec.scene_for_eval)
+        res = detect_scene(rec.image, rec.scene_for_eval, p, match=match)
+        if not res.get("recognized", False):
+            canvas = rec.image.copy()
+            cv2.putText(canvas, "TIDAK DIKENALI - perlu foto latar baru",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255),
+                        2, cv2.LINE_AA)
+            cv2.imwrite(str(out_dir / f"{Path(rec.name).stem}_rejected.jpg"), canvas)
+            continue
+        cv2.imwrite(str(out_dir / f"{Path(rec.name).stem}_overlay.jpg"),
+                    draw_overlay(rec.image, res["states"]))
+
+
+def _parse_size(text):
+    w, h = (int(v) for v in str(text).lower().split("x"))
+    return (w, h)
+
+
+def run_evaluate(args):
+    size = _parse_size(getattr(args, "size", "1280x960"))
+    params = {name: replace(p, resize=size) for name, p in VERSIONS.items()}
+    db = SceneDatabase(args.database, size=size)
+    if not db.scenes:
+        raise SystemExit(
+            f"Database adegan kosong di {args.database}. Isi "
+            f"<id_adegan>/refs/ lalu jalankan `python -m src.database build`."
+        )
 
     images = list_images(args.images)
-    gt = read_ground_truth(args.gt)
-    slots = load_slots(args.roi)
+    if not images:
+        raise SystemExit(f"Tidak ada citra uji di {args.images}")
+    gt = read_ground_truth_with_scene(args.gt)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    _, test = split_images(images, args.split, args.seed)
-    eval_images = test or images
+    records = _resolve_records(db, images, gt, params["usulan"])
+    if not records:
+        raise SystemExit("Tidak ada citra yang punya baris ground truth.")
 
-    results = []
-    usulan_per_image = {}
-    for name, p in VERSIONS.items():
-        res, per_image = evaluate_version(
-            name, p, eval_images, gt, slots, background_paths, args.reference
+    results, per_version, slot_records_by_version, rejected_by_version = [], {}, {}, {}
+    for name in VERSION_ORDER:
+        res, per_image, slot_records, rejected = evaluate_version(
+            name, params[name], records
         )
         results.append(res)
-        if name == "usulan":
-            usulan_per_image = per_image
-        print(f"[{name}] akurasi={res['accuracy']:.4f} f1_macro={res['f1_macro']:.4f} "
-              f"n_slot={res['n_slot']}")
+        per_version[name] = per_image
+        slot_records_by_version[name] = slot_records
+        rejected_by_version[name] = rejected
+        print(f"[{name}] akurasi={res['accuracy']:.4f} "
+              f"f1_macro={res['f1_macro']:.4f} n_slot={res['n_slot']} "
+              f"ditolak={res['n_rejected']}")
 
     _write_csv(out_dir / "results.csv", results, FIELDS)
 
+    sensitivity = threshold_sensitivity(slot_records_by_version["usulan"])
+    _write_csv(out_dir / "sensitivity.csv", sensitivity,
+               ["threshold", "accuracy", "precision", "recall", "f1",
+                "precision_macro", "recall_macro", "f1_macro",
+                "tp", "fp", "fn", "tn", "n_slot"])
+
+    failures = []
+    for r in slot_records_by_version["usulan"]:
+        if r["truth"] != r["pred"]:
+            failures.append({
+                "type": "salah_klasifikasi", "version": "usulan",
+                "image": r["image"], "scene": r["scene"], "slot": r["slot"],
+                "truth": r["truth"], "pred": r["pred"], "ratio": r["ratio"],
+                "reason": "",
+            })
+    for r in rejected_by_version["usulan"]:
+        failures.append({
+            "type": "ditolak", "version": "usulan", "image": r["image"],
+            "scene": r["scene"], "slot": "", "truth": "", "pred": "",
+            "ratio": "", "reason": r["reason"],
+        })
+    _write_csv(out_dir / "failures.csv", failures,
+               ["type", "version", "image", "scene", "slot", "truth",
+                "pred", "ratio", "reason"])
+
+    recognition = _scene_recognition(records)
     lines = ["# Hasil Evaluasi (level slot)", ""]
-    if args.split > 0 and len(eval_images) != len(images):
-        lines.append(f"Pembagian data: {len(images) - len(eval_images)} latih / "
-                     f"{len(eval_images)} uji (test_frac={args.split}, seed={args.seed}).")
-        lines.append("")
-    lines.append(f"Data uji: {len(eval_images)} citra, {results[0]['n_slot']} slot total.")
-    lines += [""] + _md_table(results)
-    lines += ["", "Confusion matrix (positif = terisi) per versi:", ""]
+    if "sandbox" in str(args.database).lower() or "sandbox" in str(args.images).lower():
+        lines += ["> **PERINGATAN:** hasil ini berasal dari data SINTETIS untuk "
+                  "smoke test. Jangan dilaporkan sebagai hasil penelitian.", ""]
+    lines += [
+        "## Data",
+        "",
+        f"- Database adegan: `{args.database}` ({len(db.scenes)} adegan)",
+        f"- Citra uji: `{args.images}` ({len(records)} citra ber-GT)",
+        f"- Ground truth: `{args.gt}`",
+        "",
+        "## Tabel baseline vs usulan vs ablasi",
+        "",
+    ]
+    lines += _md_table(results)
+    lines += ["", "Confusion matrix (positif = terisi):", ""]
     for r in results:
         lines.append(f"- **{r['version']}**: TP={r['tp']}, FP={r['fp']}, "
-                     f"FN={r['fn']}, TN={r['tn']}")
+                     f"FN={r['fn']}, TN={r['tn']}, ditolak={r['n_rejected']}")
+    lines += ["", "## Sensitivitas ambang (metode usulan)", ""]
+    lines += _md_sensitivity(sensitivity)
+    lines += ["", "## Rekognisi adegan", "",
+              f"- Citra ber-GT adegan: {recognition['n_with_gt']}",
+              f"- Cocok benar: {recognition['correct']} "
+              f"({_pct(recognition['accuracy'])})",
+              f"- Ditolak: {recognition['rejected']}",
+              f"- Salah adegan: {len(recognition['wrong'])}", ""]
+    for w in recognition["wrong"]:
+        lines.append(f"  - `{w['image']}`: GT={w['truth']}, pred={w['pred']} "
+                     f"(inlier={w['inliers']})")
+    lines += ["", "## Kasus gagal (metode usulan)", ""]
+    if not failures:
+        lines.append("Tidak ada kasus gagal pada data ini.")
+    else:
+        lines += ["| Tipe | Citra | Adegan | Slot | GT | Pred | Rasio | Alasan |",
+                  "|---|---|---|---|---|---|---|---|"]
+        for f in failures:
+            lines.append(f"| {f['type']} | {f['image']} | {f['scene']} | "
+                         f"{f['slot']} | {f['truth']} | {f['pred']} | "
+                         f"{f['ratio']} | {f['reason']} |")
     (out_dir / "results.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    if args.save_overlays:
-        _save_overlays(eval_images, background_paths, slots,
-                       VERSIONS["usulan"], out_dir / "overlays")
-
     with open(out_dir / "per_image.json", "w", encoding="utf-8") as f:
-        json.dump(usulan_per_image, f, indent=2, ensure_ascii=False)
+        json.dump(per_version, f, indent=2, ensure_ascii=False)
+
+    if args.save_overlays:
+        _save_overlays(records, params["usulan"], out_dir / "overlays")
 
     print(f"\nTersimpan: {out_dir/'results.csv'}, {out_dir/'results.md'}, "
+          f"{out_dir/'sensitivity.csv'}, {out_dir/'failures.csv'}, "
           f"{out_dir/'per_image.json'}")
 
 
-def run_scenes(args):
-    scenes = discover_scenes(args.scenes)
-    if not scenes:
-        raise SystemExit(f"Tidak ada scene (subfolder ber-roi.json) di {args.scenes}")
-
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    rows = []
-    per_image = {}
-    for sc in scenes:
-        _, test = split_images(sc["images"], args.split, args.seed)
-        eval_images = test or sc["images"]
-        print(f"== scene '{sc['name']}': {len(eval_images)} citra, "
-              f"{len(sc['slots'])} slot")
-        for name, p in VERSIONS.items():
-            res, pi = evaluate_version(name, p, eval_images, sc["gt"], sc["slots"],
-                                       sc["background_paths"], None)
-            row = dict(res)
-            row["scene"] = sc["name"]
-            rows.append(row)
-            if name == "usulan":
-                per_image[sc["name"]] = pi
-                if args.save_overlays:
-                    _save_overlays(eval_images, sc["background_paths"], sc["slots"],
-                                   p, out_dir / "overlays" / sc["name"])
-            print(f"   [{name}] akurasi={res['accuracy']:.4f} n_slot={res['n_slot']}")
-
-    aggregate = aggregate_scenes(rows)
-    _write_csv(out_dir / "results.csv", aggregate, FIELDS)
-    _write_csv(out_dir / "results_per_scene.csv", rows, ["scene"] + FIELDS)
-
-    lines = ["# Hasil Evaluasi Multi-Scene (level slot)", "",
-             f"Scene: {len(scenes)} — {', '.join(s['name'] for s in scenes)}", "",
-             "## Gabungan (pooled) antar scene", ""]
-    lines += _md_table(aggregate)
-    lines += ["", "## Rincian per scene", "",
-              "| Scene | Versi | Akurasi | F1 (makro) | TP | FP | FN | TN |",
-              "|---|---|---|---|---|---|---|---|"]
-    for r in rows:
-        lines.append(f"| {r['scene']} | {r['version']} | {_pct(r['accuracy'])} | "
-                     f"{_pct(r['f1_macro'])} | {r['tp']} | {r['fp']} | {r['fn']} | {r['tn']} |")
-    (out_dir / "results.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    with open(out_dir / "per_image.json", "w", encoding="utf-8") as f:
-        json.dump(per_image, f, indent=2, ensure_ascii=False)
-
-    print(f"\nTersimpan: {out_dir/'results.csv'}, {out_dir/'results_per_scene.csv'}, "
-          f"{out_dir/'results.md'}, {out_dir/'per_image.json'}")
-
-
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Evaluasi baseline vs usulan vs ablasi")
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--images", help="folder/berkas citra uji (mode satu scene)")
-    src.add_argument("--scenes", help="folder berisi subfolder scene (mode multi-scene)")
-    ap.add_argument("--background", help="folder citra latar kosong (mode satu scene)")
-    ap.add_argument("--roi", help="berkas roi.json (mode satu scene)")
-    ap.add_argument("--gt", help="ground_truth.csv (mode satu scene)")
-    ap.add_argument("--reference", default=None,
-                    help="frame acuan tunggal untuk baseline (default: citra latar pertama)")
-    ap.add_argument("--split", type=float, default=0.0,
-                    help="fraksi data uji (mis. 0.3 untuk 70/30; 0 = pakai semua)")
-    ap.add_argument("--seed", type=int, default=42, help="benih pembagian data")
+    ap.add_argument("--database", default="data/database",
+                    help="folder database adegan (hasil src.database build)")
+    ap.add_argument("--images", required=True, help="folder/berkas citra uji")
+    ap.add_argument("--gt", required=True, help="ground_truth.csv (image,scene,slot...)")
     ap.add_argument("--out", default="data/outputs", help="folder keluaran")
+    ap.add_argument("--size", default="1280x960",
+                    help="ukuran kerja WxH (default 1280x960)")
     ap.add_argument("--save-overlays", action="store_true",
-                    help="simpan citra overlay untuk metode usulan")
-    args = ap.parse_args()
-
-    if args.scenes:
-        run_scenes(args)
-    else:
-        if not (args.background and args.roi and args.gt):
-            ap.error("mode satu scene butuh --background, --roi, dan --gt")
-        run_single(args)
+                    help="simpan citra overlay metode usulan")
+    args = ap.parse_args(argv)
+    run_evaluate(args)
 
 
 if __name__ == "__main__":
