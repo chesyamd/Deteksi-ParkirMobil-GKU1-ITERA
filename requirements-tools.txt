@@ -1,0 +1,3 @@
+# Dependensi opsional untuk alat bantu (bukan syarat pipeline inti).
+# Konversi HEIC cepat tanpa ImageMagick.
+pillow-heif>=0.16

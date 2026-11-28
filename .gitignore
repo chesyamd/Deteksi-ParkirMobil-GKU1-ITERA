@@ -12,6 +12,12 @@ venv/
 .vscode/
 .idea/
 
+# Foto mentah ponsel: jangan pernah di-commit (ukuran besar + privasi).
+*.heic
+*.HEIC
+*.heif
+*.HEIF
+
 # Citra & hasil: tidak di-commit (dibagikan lewat Drive), struktur folder tetap ada.
 data/raw/*
 data/background/*
@@ -21,6 +27,14 @@ data/outputs/*
 !data/background/.gitkeep
 !data/source/.gitkeep
 !data/outputs/.gitkeep
+
+# Database adegan: foto ref + hasil build tidak di-commit; metadata/ROI di-commit.
+data/database/*/refs/*
+!data/database/*/refs/.gitkeep
+data/database/*/canonical.jpg
+data/database/*/background.jpg
+data/database/*/valid_mask.png
+data/database/*/build.json
 
 # Multi-scene (paket I-07): citra tiap scene tidak di-commit, anotasi (roi.json,
 # ground_truth.csv) tetap masuk repo.
